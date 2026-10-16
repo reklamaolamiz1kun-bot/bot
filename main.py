@@ -301,6 +301,7 @@ async def help_command_from_callback(query):
     )
 
 
+
 def main():
     if not TOKEN:
         raise RuntimeError(
@@ -308,14 +309,34 @@ def main():
             "bo‘limiga BOT_TOKEN qo‘sh."
         )
 
-    app = Application.builder().token(TOKEN).build()
+    from telegram.request import HTTPXRequest
+
+    request = HTTPXRequest(
+        connect_timeout=30,
+        read_timeout=30,
+        write_timeout=30,
+        pool_timeout=30,
+        connection_pool_size=8,
+    )
+
+    app = (
+        Application.builder()
+        .token(TOKEN)
+        .request(request)
+        .build()
+    )
+
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CallbackQueryHandler(callback))
 
     print("SUMMON PvP COACH ishga tushdi!")
-    app.run_polling()
+    app.run_polling(
+        bootstrap_retries=5,
+        timeout=30,
+    )
 
 
 if __name__ == "__main__":
     main()
+

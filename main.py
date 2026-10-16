@@ -75,6 +75,25 @@ def back_home():
     return kb([[button('🏠 Bosh menyu', 'home', 'primary')]])
 
 
+def roblox_search_kb(user_id):
+    return kb([
+        [button('👕 Classic Shirts', 'catalog:Classic+Shirts'), button('👖 Pants', 'catalog:Pants')],
+        [button('🧥 Layered Clothing', 'catalog:Layered+Clothing'), button('💇 Hair', 'catalog:Hair')],
+        [button('😎 Accessories', 'catalog:Accessories'), button('🕺 Animations', 'catalog:Animations')],
+        [button('🧍 Avatar items (worn)', f'worn:{user_id}', 'success')],
+        [button('💎 Robux / Premium info', 'robux_info')],
+        [button('🔗 Roblox profile', f'avatar_profile:{user_id}', 'success')],
+        [button('🏠 Bosh menyu', 'home', 'primary')],
+    ])
+
+
+def catalog_kb(query):
+    from urllib.parse import quote_plus
+    url = 'https://www.roblox.com/catalog?Keyword=' + quote_plus(query.replace('+', ' '))
+    return kb([[InlineKeyboardButton('🔎 Roblox Catalog’da ko‘rish', url=url)],
+               [button('⬅️ Avatar menyusi', 'avatar_menu'), button('🏠 Bosh menyu', 'home')]])
+
+
 def is_admin(user_id):
     return user_id in ADMIN_IDS
 
@@ -217,13 +236,12 @@ async def avatar_username_step(update: Update, context: ContextTypes.DEFAULT_TYP
             f'🆔 User ID: {user_id}\n'
             f'🔗 Profil: https://www.roblox.com/users/{user_id}/profile'
         )
+        context.user_data['roblox_user_id'] = user_id
+        context.user_data['roblox_username'] = real_username
         if image_url:
-            await update.message.reply_photo(photo=image_url, caption=caption, reply_markup=kb([
-                [button('🔗 Roblox profilini ochish', 'avatar_profile:' + str(user_id), 'success')],
-                [button('🏠 Bosh menyu', 'home', 'primary')],
-            ]))
+            await update.message.reply_photo(photo=image_url, caption=caption, reply_markup=roblox_search_kb(user_id))
         else:
-            await update.message.reply_text(caption + '\n\nAvatar rasmi hozircha olinmadi.', reply_markup=home_kb())
+            await update.message.reply_text(caption + '\n\nAvatar rasmi hozircha olinmadi.', reply_markup=roblox_search_kb(user_id))
     except httpx.TimeoutException:
         await update.message.reply_text('⏳ Roblox serveri javob bermadi. Birozdan keyin urin.', reply_markup=home_kb())
     except (httpx.HTTPError, ValueError, KeyError) as exc:
@@ -248,6 +266,33 @@ async def callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data.startswith('avatar_profile:'):
         user_id = data.split(':', 1)[1]
         await q.message.reply_text(f'https://www.roblox.com/users/{user_id}/profile')
+    elif data == 'avatar_menu':
+        user_id = context.user_data.get('roblox_user_id')
+        if not user_id:
+            await q.message.reply_text('Avval Roblox username qidiruvini bajaring.', reply_markup=home_kb())
+        else:
+            await q.message.reply_text('🧑‍🎤 AVATAR / INVENTORY SEARCH\nBo‘limni tanlang:', reply_markup=roblox_search_kb(user_id))
+    elif data.startswith('catalog:'):
+        query = data.split(':', 1)[1]
+        labels = {'Classic+Shirts':'Classic Shirts / Futbolkalar', 'Pants':'Pants / Shimlar', 'Layered+Clothing':'Layered Clothing / Ustki kiyimlar', 'Hair':'Hair / Sochlar', 'Accessories':'Accessories / Aksessuarlar', 'Animations':'Animations / Animatsiyalar'}
+        await q.message.reply_text('🛍 ' + labels.get(query, query) + '\nRoblox katalogini ochib itemlarni ko‘rishingiz mumkin. Narxlar katalogda ko‘rsatiladi.', reply_markup=catalog_kb(query))
+    elif data.startswith('worn:'):
+        user_id = data.split(':', 1)[1]
+        try:
+            async with httpx.AsyncClient(timeout=15.0) as client:
+                resp = await client.get(f'https://avatar.roblox.com/v1/users/{user_id}/currently-wearing')
+                resp.raise_for_status()
+                asset_ids = resp.json().get('assetIds', [])
+            if not asset_ids:
+                await q.message.reply_text('Hozir kiyilgan itemlar ro‘yxati ochiq API orqali olinmadi. Inventar maxfiy yoki bo‘sh bo‘lishi mumkin.', reply_markup=roblox_search_kb(user_id))
+            else:
+                lines = [f'• Asset ID: {aid} — https://www.roblox.com/catalog/{aid}' for aid in asset_ids[:30]]
+                await q.message.reply_text('🧥 AVATARDA KIYILGAN ITEMLAR\n\n' + '\n'.join(lines) + '\n\nNarx va rasmni item sahifasida tekshiring.', disable_web_page_preview=True, reply_markup=roblox_search_kb(user_id))
+        except (httpx.HTTPError, ValueError) as exc:
+            log.warning('Roblox currently-wearing lookup failed: %s', exc)
+            await q.message.reply_text('⚠️ Kiyilgan itemlarni hozir olib bo‘lmadi. Keyinroq urinib ko‘ring.', reply_markup=roblox_search_kb(user_id))
+    elif data == 'robux_info':
+        await q.message.reply_text('💎 ROBUX / PREMIUM\n\nRoblox ochiq API odatda foydalanuvchining joriy Robux balansini, Premium obunasini, xaridlar tarixini yoki qaysi o‘yinlarga qancha Robux donate qilganini ko‘rsatmaydi. Bot bularni taxmin qilib chiqarmaydi.\n\nOchiq avatar rasmi, username, profil va ayrim kiyilgan asset ID’larini esa ko‘rsatishi mumkin.', reply_markup=kb([[button('⬅️ Avatar menyusi', 'avatar_menu'), button('🏠 Bosh menyu', 'home')]]))
     elif data == 'new':
         return await new_listing(update, context)
     elif data == 'rules':

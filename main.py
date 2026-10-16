@@ -1,342 +1,323 @@
-
 import os
-import ast
-import random
 import logging
-import operator
-
+import sqlite3
+from datetime import datetime, timezone
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import (
-    Application,
-    CommandHandler,
-    CallbackQueryHandler,
-    ContextTypes,
-)
+from telegram.ext import (Application, CommandHandler, CallbackQueryHandler,
+    MessageHandler, ContextTypes, filters, ConversationHandler)
 
-logging.basicConfig(level=logging.INFO)
-logging.getLogger("httpx").setLevel(logging.WARNING)
-
-TOKEN = os.getenv("BOT_TOKEN")
-
-
-def btn(text, data, style="primary"):
-    return InlineKeyboardButton(
-        text=text,
-        callback_data=data,
-        style=style,
-    )
+TOKEN = os.getenv('BOT_TOKEN', '').strip()
+ADMIN_IDS = {int(x.strip()) for x in os.getenv('ADMIN_IDS', '').split(',') if x.strip().isdigit()}
+DB_PATH = os.getenv('DB_PATH', 'market.db')
+TITLE, DESCRIPTION, PRICE, CONTACT, RATE_ID, RATE_SCORE, RATE_COMMENT = range(7)
+logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(name)s: %(message)s')
+logging.getLogger('httpx').setLevel(logging.WARNING)
+log = logging.getLogger('summon_market')
 
 
-def markup(rows):
+def db():
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def init_db():
+    with db() as c:
+        c.execute('''CREATE TABLE IF NOT EXISTS users (
+            user_id INTEGER PRIMARY KEY, username TEXT, first_name TEXT,
+            joined_at TEXT NOT NULL)''')
+        c.execute('''CREATE TABLE IF NOT EXISTS listings (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, seller_id INTEGER NOT NULL,
+            title TEXT NOT NULL, description TEXT NOT NULL, price TEXT NOT NULL,
+            contact TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'pending',
+            created_at TEXT NOT NULL)''')
+        c.execute('''CREATE TABLE IF NOT EXISTS ratings (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, listing_id INTEGER NOT NULL,
+            rater_id INTEGER NOT NULL, seller_id INTEGER NOT NULL,
+            score INTEGER NOT NULL, comment TEXT NOT NULL, created_at TEXT NOT NULL,
+            UNIQUE(listing_id, rater_id))''')
+
+
+def now():
+    return datetime.now(timezone.utc).isoformat(timespec='seconds')
+
+
+def register_user(user):
+    with db() as c:
+        c.execute('INSERT INTO users(user_id, username, first_name, joined_at) VALUES(?,?,?,?) '
+                  'ON CONFLICT(user_id) DO UPDATE SET username=excluded.username, first_name=excluded.first_name',
+                  (user.id, user.username or '', user.first_name or '', now()))
+
+
+def button(text, data, style='primary'):
+    # Button colors are supported only by compatible Telegram clients/Bot API versions.
+    try:
+        return InlineKeyboardButton(text, callback_data=data, style=style)
+    except TypeError:
+        return InlineKeyboardButton(text, callback_data=data)
+
+
+def kb(rows):
     return InlineKeyboardMarkup(rows)
 
 
-def main_menu():
-    return markup([
-        [btn("🍎 Fruit Build", "fruits", "success"),
-         btn("🔥 PvP Combos", "combos", "danger")],
-        [btn("🥋 Fighting Style", "styles", "primary"),
-         btn("🗡️ Sword & Race", "equipment", "success")],
-        [btn("🎯 Mashq rejasi", "practice", "primary"),
-         btn("ℹ️ Yordam", "help", "primary")],
+def home_kb():
+    return kb([
+        [button('🛍 E’lonlarni ko‘rish', 'browse', 'success'), button('➕ E’lon berish', 'new', 'primary')],
+        [button('⭐ Reytinglar', 'ratings', 'success'), button('👤 Profilim', 'profile', 'primary')],
+        [button('📜 Qoidalar', 'rules', 'danger')],
     ])
 
 
-def back_button(destination="home"):
-    return markup([[btn("⬅️ Orqaga", destination)]])
+def back_home():
+    return kb([[button('🏠 Bosh menyu', 'home', 'primary')]])
 
 
-FRUITS = {
-    "Dough": {
-        "style": "Godhuman / Electric Claw",
-        "sword": "Cursed Dual Katana (CDK)",
-        "race": "Ghoul / Angel",
-        "difficulty": "O‘rta–qiyin",
-        "tip": "Stun va skill vaqtini mashq qil."
-    },
-    "Ice": {
-        "style": "Godhuman / Sharkman Karate",
-        "sword": "CDK / Yama",
-        "race": "Angel / Shark",
-        "difficulty": "Oson–o‘rta",
-        "tip": "Freeze orqali combo boshlashni o‘rgan."
-    },
-    "Dark": {
-        "style": "Godhuman / Electric Claw",
-        "sword": "CDK / Shark Anchor",
-        "race": "Ghoul / Cyborg",
-        "difficulty": "O‘rta",
-        "tip": "Stun va yaqin masofali hujumlarni mashq qil."
-    },
-    "Portal": {
-        "style": "Godhuman / Electric Claw",
-        "sword": "CDK / Shark Anchor",
-        "race": "Ghoul / Angel",
-        "difficulty": "Qiyin",
-        "tip": "Harakat, joylashuv va sword almashishni mashq qil."
-    },
-    "Tiger": {
-        "style": "Godhuman / Electric Claw",
-        "sword": "CDK / Shark Anchor",
-        "race": "Ghoul / Angel",
-        "difficulty": "O‘rta–qiyin",
-        "tip": "Hujum vaqtini va masofani nazorat qil."
-    },
-    "Gas": {
-        "style": "Godhuman / Electric Claw",
-        "sword": "CDK / Shark Anchor",
-        "race": "Cyborg / Ghoul",
-        "difficulty": "O‘rta",
-        "tip": "Skill vaqtini va maydon nazoratini mashq qil."
-    },
-    "Kitsune": {
-        "style": "Godhuman / Electric Claw",
-        "sword": "CDK / Shark Anchor",
-        "race": "Angel / Ghoul",
-        "difficulty": "O‘rta",
-        "tip": "Mobillikdan foydalan va hujumlarni aniq vaqtla."
-    },
-    "Dragon": {
-        "style": "Godhuman / Electric Claw",
-        "sword": "CDK / Shark Anchor",
-        "race": "Angel / Ghoul",
-        "difficulty": "Qiyin",
-        "tip": "Skill ketma-ketligini va transformatsiyani mashq qil."
-    },
-    "Buddha": {
-        "style": "Sharkman Karate / Godhuman",
-        "sword": "O‘zingdagi qulay sword",
-        "race": "Shark / Ghoul",
-        "difficulty": "O‘rta",
-        "tip": "Yaqin masofada harakat va hujum vaqtini o‘rgan."
-    },
-    "Light": {
-        "style": "Godhuman / Electric Claw",
-        "sword": "CDK / Yama",
-        "race": "Angel / Ghoul",
-        "difficulty": "O‘rta",
-        "tip": "Masofa va skill aniqligini mashq qil."
-    },
-}
-
-
-COMBOS = {
-    "easy": [
-        ("Ice", "Ice Z → Fighting Style Z → Sword skill"),
-        ("Dark", "Dark C → Fighting Style Z → Sword skill"),
-        ("Dough", "Dough C → Dough X → Fighting Style skill"),
-        ("Light", "Light skill → Sword skill → Fighting Style"),
-    ],
-    "medium": [
-        ("Ice", "Ice Z → Sword Z → Fighting Style X → Ice X"),
-        ("Dark", "Dark C → Sword skill → Fighting Style X → Dark X"),
-        ("Dough", "Dough C → Dough X → Sword skill → Fighting Style"),
-        ("Gas", "Gas Z → Sword skill → Gas X → Fighting Style"),
-    ],
-    "hard": [
-        ("Ice", "Ice Z → Sword Z → Fighting Style X → Ice X → Sword X"),
-        ("Dark", "Dark C → Sword Z → Fighting Style X → Dark X"),
-        ("Dough", "Dough C → Dough X → Sword Z → Fighting Style X"),
-        ("Portal", "Portal skill → Sword skill → Fighting Style → Portal"),
-    ],
-}
-
-
-TIPS = [
-    "🎯 Avval skillni nishonga tekkizishni mashq qil.",
-    "⚔️ Combo ichidagi skilllar orasidagi vaqtni o‘rgan.",
-    "🏃 Raqibning hujumidan qochishni ham mashq qil.",
-    "🧠 Bitta buildni tanlab, uni yaxshilab o‘rgan.",
-    "🔧 Stat va mastery buildga mos ekanini tekshir.",
-]
-
+def is_admin(user_id):
+    return user_id in ADMIN_IDS
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.effective_message.reply_text(
-        "💎 SUMMON PvP COACH\n\n"
-        "🏴‍☠️ Blox Fruits PvP yordamching!\n"
-        "🍎 Fruit build tanla\n"
-        "🔥 Combo ko‘r\n"
-        "🥋 Fighting style va sword tanla\n"
-        "🎯 Mashq rejasidan foydalan\n\n"
-        "👇 Bo‘limni tanla:",
-        reply_markup=main_menu(),
-    )
+    user = update.effective_user
+    register_user(user)
+    text = (f"🛒 SUMMON ROBLOX MARKET\n\nSalom, {user.first_name}!\n"
+            "Roblox o‘yinidagi itemlar va xizmatlar uchun e’lonlar maydoni.\n\n"
+            "✅ E’lonlar admin tekshiruvidan o‘tadi.\n"
+            "⚠️ Parol, cookie yoki akkauntga kirish ma’lumotlarini so‘ramang va yubormang.")
+    await update.effective_message.reply_text(text, reply_markup=home_kb())
 
+async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.effective_message.reply_text('/start — menyu\n/cancel — amalni bekor qilish\n/admin — admin panel (adminlar uchun)')
 
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.effective_message.reply_text(
-        "📚 BUYRUQLAR\n\n"
-        "/start — asosiy menyu\n"
-        "/help — yordam\n\n"
-        "Tugmalar orqali bo‘limlarni tanla.",
-        reply_markup=main_menu(),
-    )
+async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data.clear()
+    await update.effective_message.reply_text('Amal bekor qilindi.', reply_markup=home_kb())
+    return ConversationHandler.END
 
+async def new_listing(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.callback_query.answer()
+    context.user_data.clear()
+    await update.callback_query.message.reply_text('E’lon sarlavhasini yoz (5–70 belgi).\n/cancel — bekor qilish')
+    return TITLE
 
-async def show_fruit(query, fruit):
-    data = FRUITS[fruit]
-    await query.edit_message_text(
-        f"🍎 {fruit.upper()} PVP BUILD\n\n"
-        f"🎯 Qiyinlik: {data['difficulty']}\n"
-        f"🥋 Fighting style: {data['style']}\n"
-        f"🗡️ Sword: {data['sword']}\n"
-        f"🧬 Race: {data['race']}\n\n"
-        f"💡 Maslahat: {data['tip']}\n\n"
-        "Eslatma: buildlar tavsiya sifatida berilgan. "
-        "Aniq combo natijasi update, stat va masteryga bog‘liq.",
-        reply_markup=markup([
-            [btn("🔥 Combo katalogi", "combos", "danger")],
-            [btn("⬅️ Mevalar", "fruits")],
-            [btn("🏠 Asosiy menyu", "home")],
-        ]),
-    )
+async def title_step(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    title = update.message.text.strip()
+    if len(title) < 5 or len(title) > 70:
+        await update.message.reply_text('Sarlavha 5–70 belgi bo‘lsin. Qayta yoz:')
+        return TITLE
+    context.user_data['title'] = title
+    await update.message.reply_text('E’lon tavsifini yoz (10–500 belgi). Akkaunt paroli yoki cookie kiritma.')
+    return DESCRIPTION
 
+async def description_step(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    desc = update.message.text.strip()
+    if len(desc) < 10 or len(desc) > 500:
+        await update.message.reply_text('Tavsif 10–500 belgi bo‘lsin. Qayta yoz:')
+        return DESCRIPTION
+    context.user_data['description'] = desc
+    await update.message.reply_text('Narxni yoz (masalan: 25 000 so‘m, bepul yoki kelishiladi):')
+    return PRICE
+
+async def price_step(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    price = update.message.text.strip()
+    if len(price) > 40:
+        await update.message.reply_text('Narxni qisqaroq yoz:')
+        return PRICE
+    context.user_data['price'] = price
+    await update.message.reply_text('Aloqa usulini yoz: Telegram username yoki “shu bot orqali”. Telefon raqam majburiy emas.')
+    return CONTACT
+
+async def contact_step(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    contact = update.message.text.strip()
+    if len(contact) > 100:
+        await update.message.reply_text('Aloqa ma’lumoti 100 belgidan oshmasin:')
+        return CONTACT
+    user = update.effective_user
+    data = context.user_data
+    with db() as c:
+        cur = c.execute('INSERT INTO listings(seller_id,title,description,price,contact,status,created_at) VALUES(?,?,?,?,?,?,?)',
+            (user.id, data['title'], data['description'], data['price'], contact, 'pending', now()))
+        listing_id = cur.lastrowid
+    await update.message.reply_text(f'✅ E’lon #{listing_id} admin tekshiruviga yuborildi. Tasdiqlansa hammaga ko‘rinadi.', reply_markup=home_kb())
+    for admin_id in ADMIN_IDS:
+        try:
+            await context.bot.send_message(admin_id,
+                f'🆕 Yangi e’lon #{listing_id}\nSotuvchi: {user.full_name} (@{user.username or "yo‘q"})\n'
+                f'{data["title"]}\n{data["description"]}\nNarx: {data["price"]}\nAloqa: {contact}',
+                reply_markup=kb([[button('✅ Tasdiqlash', f'approve:{listing_id}', 'success'),
+                                  button('❌ Rad etish', f'reject:{listing_id}', 'danger')]]))
+        except Exception:
+            log.exception('Admin notification failed')
+    context.user_data.clear()
+    return ConversationHandler.END
+
+async def browse(query, context):
+    with db() as c:
+        rows = c.execute("SELECT id,title,description,price,seller_id FROM listings WHERE status='approved' ORDER BY id DESC LIMIT 10").fetchall()
+    if not rows:
+        await query.edit_message_text('Hozircha tasdiqlangan e’lon yo‘q.', reply_markup=back_home())
+        return
+    for row in rows:
+        with db() as c:
+            rating = c.execute('SELECT AVG(score) avg, COUNT(*) n FROM ratings WHERE seller_id=?', (row['seller_id'],)).fetchone()
+        avg = f"{rating['avg']:.1f}/5 ({rating['n']} ta)" if rating['n'] else 'hali reyting yo‘q'
+        text = (f"🛍 E’lon #{row['id']}\n{row['title']}\n\n{row['description']}\n\n"
+                f"💰 Narx: {row['price']}\n⭐ Sotuvchi reytingi: {avg}")
+        await context.bot.send_message(query.message.chat_id, text, reply_markup=kb([
+            [button('✉️ Sotuvchi bilan aloqa', f'contact:{row["id"]}', 'success'),
+             button('⭐ Baholash', f'rate:{row["id"]}', 'primary')]]))
+    await context.bot.send_message(query.message.chat_id, 'E’lonlar tugadi.', reply_markup=back_home())
 
 async def callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    key = query.data
+    q = update.callback_query
+    data = q.data
+    if data.startswith(('approve:', 'reject:')) and not is_admin(q.from_user.id):
+        await q.answer('Bu amal faqat admin uchun.', show_alert=True)
+        return
+    await q.answer()
+    if data == 'home':
+        await q.edit_message_text('🛒 SUMMON ROBLOX MARKET\nKerakli bo‘limni tanla:', reply_markup=home_kb())
+    elif data == 'browse':
+        await browse(q, context)
+    elif data == 'new':
+        return await new_listing(update, context)
+    elif data == 'rules':
+        await q.edit_message_text('📜 MARKET QOIDALARI\n\n• E’lonlar admin tomonidan tekshiriladi.\n• Roblox akkauntlarini, parol, cookie yoki login ma’lumotlarini sotish/so‘rash mumkin emas.\n• Aldov yoki soxta e’lonlar taqiqlanadi.\n• To‘lovdan oldin sotuvchini tekshiring; bot to‘lovni kafolatlamaydi.', reply_markup=back_home())
+    elif data == 'profile':
+        user = q.from_user
+        with db() as c:
+            listings = c.execute('SELECT COUNT(*) n FROM listings WHERE seller_id=?', (user.id,)).fetchone()['n']
+            rating = c.execute('SELECT AVG(score) avg, COUNT(*) n FROM ratings WHERE seller_id=?', (user.id,)).fetchone()
+        avg = f"{rating['avg']:.1f}/5 ({rating['n']} ta baho)" if rating['n'] else 'hali yo‘q'
+        await q.edit_message_text(f'👤 Profil\nID: {user.id}\nE’lonlar: {listings}\nReyting: {avg}', reply_markup=back_home())
+    elif data == 'ratings':
+        with db() as c:
+            rows = c.execute('SELECT seller_id, AVG(score) avg, COUNT(*) n FROM ratings GROUP BY seller_id ORDER BY avg DESC, n DESC LIMIT 10').fetchall()
+        if not rows:
+            text = '⭐ Hali reytinglar yo‘q.'
+        else:
+            text = '⭐ TOP SOTUVCHILAR\n\n' + '\n'.join(f"{i+1}. ID {r['seller_id']} — {r['avg']:.1f}/5 ({r['n']} ta)" for i,r in enumerate(rows))
+        await q.edit_message_text(text, reply_markup=back_home())
+    elif data.startswith('approve:') or data.startswith('reject:'):
+        action, sid = data.split(':')
+        status = 'approved' if action == 'approve' else 'rejected'
+        with db() as c:
+            c.execute('UPDATE listings SET status=? WHERE id=? AND status=?', (status, int(sid), 'pending'))
+            row = c.execute('SELECT seller_id,title FROM listings WHERE id=?', (int(sid),)).fetchone()
+        await q.edit_message_reply_markup(reply_markup=None)
+        await q.message.reply_text(f'#{sid} {"tasdiqlandi ✅" if status == "approved" else "rad etildi ❌"}')
+        if row:
+            try:
+                await context.bot.send_message(row['seller_id'], f'E’lon #{sid} holati: {"tasdiqlandi" if status == "approved" else "rad etildi"}.\n{row["title"]}')
+            except Exception:
+                pass
+    elif data.startswith('contact:'):
+        lid = int(data.split(':')[1])
+        with db() as c:
+            row = c.execute("SELECT seller_id,contact,title FROM listings WHERE id=? AND status='approved'", (lid,)).fetchone()
+        if not row:
+            await q.message.reply_text('E’lon topilmadi.')
+        elif row['seller_id'] == q.from_user.id:
+            await q.message.reply_text('Bu sening e’loning.')
+        else:
+            await q.message.reply_text(f"✉️ {row['title']}\nSotuvchi aloqa ma’lumoti: {row['contact']}\n\nShaxsiy ma’lumot va to‘lovda ehtiyot bo‘l.")
+    elif data.startswith('rate:'):
+        lid = int(data.split(':')[1])
+        with db() as c:
+            row = c.execute("SELECT seller_id FROM listings WHERE id=? AND status='approved'", (lid,)).fetchone()
+            exists = c.execute('SELECT 1 FROM ratings WHERE listing_id=? AND rater_id=?', (lid, q.from_user.id)).fetchone()
+        if not row or row['seller_id'] == q.from_user.id or exists:
+            await q.message.reply_text('Bu e’lonni baholab bo‘lmaydi (o‘zingniki yoki avval baholangan).')
+        else:
+            context.user_data['rate_listing'] = lid
+            context.user_data['rate_seller'] = row['seller_id']
+            await q.message.reply_text('Sotuvchiga 1 dan 5 gacha baho ber:', reply_markup=kb([[button(str(n)+' ⭐', f'score:{n}', 'success' if n >= 4 else 'primary') for n in range(1,6)]]))
+    elif data.startswith('score:'):
+        score = int(data.split(':')[1])
+        if not 1 <= score <= 5 or 'rate_listing' not in context.user_data:
+            await q.message.reply_text('Baholash sessiyasi tugagan. E’londan qayta boshlang.')
+        else:
+            context.user_data['rate_score'] = score
+            await q.message.reply_text('Qisqa izoh yoz (yoki “-”):')
+            return RATE_COMMENT
+    elif data == 'admin':
+        if not is_admin(q.from_user.id):
+            await q.answer('Ruxsat yo‘q', show_alert=True)
+            return
+        with db() as c:
+            pending = c.execute("SELECT COUNT(*) n FROM listings WHERE status='pending'").fetchone()['n']
+            users = c.execute('SELECT COUNT(*) n FROM users').fetchone()['n']
+            total = c.execute('SELECT COUNT(*) n FROM listings').fetchone()['n']
+        await q.edit_message_text(f'🛠 ADMIN PANEL\nFoydalanuvchilar: {users}\nJami e’lonlar: {total}\nKutilayotgan e’lonlar: {pending}', reply_markup=back_home())
 
-    if key == "home":
-        await query.edit_message_text(
-            "💎 SUMMON PvP COACH\nBo‘limni tanla:",
-            reply_markup=main_menu(),
-        )
+async def save_rating(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    comment = update.message.text.strip()[:250]
+    lid = context.user_data.get('rate_listing')
+    seller = context.user_data.get('rate_seller')
+    score = context.user_data.get('rate_score')
+    if not lid or not seller or not score:
+        await update.message.reply_text('Baholash topilmadi. E’londan qayta boshlang.')
+        return ConversationHandler.END
+    try:
+        with db() as c:
+            c.execute('INSERT INTO ratings(listing_id,rater_id,seller_id,score,comment,created_at) VALUES(?,?,?,?,?,?)',
+                      (lid, update.effective_user.id, seller, score, comment, now()))
+        await update.message.reply_text('⭐ Bahoying saqlandi. Rahmat!', reply_markup=home_kb())
+    except sqlite3.IntegrityError:
+        await update.message.reply_text('Bu e’lonni avval baholagansan.', reply_markup=home_kb())
+    context.user_data.clear()
+    return ConversationHandler.END
 
-    elif key == "fruits":
-        names = list(FRUITS.keys())
-        rows = []
-        for i in range(0, len(names), 2):
-            rows.append([
-                btn("🍎 " + name, "fruit:" + name, "success")
-                for name in names[i:i + 2]
-            ])
-        rows.append([btn("⬅️ Menyu", "home")])
-        await query.edit_message_text(
-            "🍎 MEVANGNI TANLA:",
-            reply_markup=markup(rows),
-        )
+async def admin_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        await update.message.reply_text('Bu buyruq faqat admin uchun.')
+        return
+    with db() as c:
+        pending = c.execute("SELECT id,title,description,price,seller_id FROM listings WHERE status='pending' ORDER BY id LIMIT 10").fetchall()
+        users = c.execute('SELECT COUNT(*) n FROM users').fetchone()['n']
+        total = c.execute('SELECT COUNT(*) n FROM listings').fetchone()['n']
+    await update.message.reply_text(f'🛠 ADMIN PANEL\nFoydalanuvchilar: {users}\nJami e’lonlar: {total}\nKutilayotgan: {len(pending)}')
+    for r in pending:
+        await update.message.reply_text(f"#{r['id']} — {r['title']}\n{r['description']}\nNarx: {r['price']}\nSotuvchi ID: {r['seller_id']}", reply_markup=kb([[button('✅ Tasdiqlash', f"approve:{r['id']}", 'success'), button('❌ Rad etish', f"reject:{r['id']}", 'danger')]]))
 
-    elif key.startswith("fruit:"):
-        fruit = key.split(":", 1)[1]
-        if fruit in FRUITS:
-            await show_fruit(query, fruit)
+async def post_init(app):
+    await app.bot.set_my_commands([('start', 'Asosiy menyu'), ('help', 'Yordam'), ('cancel', 'Amalni bekor qilish'), ('admin', 'Admin panel')])
 
-    elif key == "combos":
-        await query.edit_message_text(
-            "🔥 COMBO QIYINLIGINI TANLA:",
-            reply_markup=markup([
-                [btn("🟢 Oson", "combo:easy", "success")],
-                [btn("🟡 O‘rta", "combo:medium", "primary")],
-                [btn("🔴 Qiyin", "combo:hard", "danger")],
-                [btn("⬅️ Menyu", "home")],
-            ]),
-        )
-
-    elif key.startswith("combo:"):
-        level = key.split(":", 1)[1]
-        combos = COMBOS.get(level)
-        if combos:
-            title = {"easy": "🟢 OSON", "medium": "🟡 O‘RTA",
-                     "hard": "🔴 QIYIN"}.get(level, "COMBO")
-            text = f"🔥 {title} COMBOLAR\n\n"
-            for fruit, sequence in combos:
-                text += f"🍎 {fruit}\n{sequence}\n\n"
-            text += (
-                "⚠️ Namunaviy combo ketma-ketliklari. "
-                "Barcha skilllar har doim ulanmasligi mumkin."
-            )
-            await query.edit_message_text(
-                text,
-                reply_markup=markup([
-                    [btn("⬅️ Qiyinliklar", "combos")],
-                    [btn("🏠 Menyu", "home")],
-                ]),
-            )
-
-    elif key == "styles":
-        await query.edit_message_text(
-            "🥋 FIGHTING STYLE\n\n"
-            "• Godhuman — ko‘p buildlarda ishlatiladi.\n"
-            "• Electric Claw — tezkor hujumlar uchun.\n"
-            "• Sharkman Karate — yaqin jang uchun.\n"
-            "• Dragon Talon — alohida mashq talab qiladi.\n\n"
-            "Eng mos tanlov meva va o‘yin uslubiga bog‘liq.",
-            reply_markup=back_button(),
-        )
-
-    elif key == "equipment":
-        await query.edit_message_text(
-            "🗡️ SWORD VA RACE\n\n"
-            "Sword: CDK, Yama, Shark Anchor kabi variantlarni "
-            "o‘zingdagi qurolga qarab tanla.\n\n"
-            "Angel: himoya va harakat imkoniyatlari.\n"
-            "Ghoul: ayrim jang uslublari bilan mos.\n"
-            "Cyborg: raqibga bosim berishga mos.\n"
-            "Shark: himoyaga urg‘u beradi.\n\n"
-            "Build va race imkoniyatlarini o‘yin ichida tekshir.",
-            reply_markup=back_button(),
-        )
-
-    elif key == "practice":
-        await query.edit_message_text(
-            "🎯 PVP MASHQ REJASI\n\n"
-            "1. 5 daqiqa: skill aniqligi.\n"
-            "2. 5 daqiqa: ikkita skillni ulash.\n"
-            "3. 5 daqiqa: dodging va masofa.\n"
-            "4. 5 daqiqa: do‘st bilan sparring.\n\n"
-            "Har kuni o‘zing qiynalayotgan bitta narsani mashq qil.",
-            reply_markup=back_button(),
-        )
-
-    elif key == "help":
-        await help_command_from_callback(query)
-
-async def help_command_from_callback(query):
-    await query.edit_message_text(
-        "/start — asosiy menyu\n/help — yordam\n\n"
-        "Tugmalardan foydalanib build va combo tanla.",
-        reply_markup=back_button(),
-    )
-
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
+    log.exception('Unhandled bot error', exc_info=context.error)
 
 
 def main():
     if not TOKEN:
-        raise RuntimeError(
-            "BOT_TOKEN topilmadi! Render Environment Variables "
-            "bo‘limiga BOT_TOKEN qo‘sh."
-        )
-
-    from telegram.request import HTTPXRequest
-
-    request = HTTPXRequest(
-        connect_timeout=30,
-        read_timeout=30,
-        write_timeout=30,
-        pool_timeout=30,
-        connection_pool_size=8,
+        raise RuntimeError('Render Environment Variables ichida BOT_TOKEN qo‘shilmagan.')
+    init_db()
+    app = Application.builder().token(TOKEN).post_init(post_init).build()
+    listing_conv = ConversationHandler(
+        entry_points=[CallbackQueryHandler(new_listing, pattern='^new$')],
+        states={
+            TITLE: [MessageHandler(filters.TEXT & ~filters.COMMAND, title_step)],
+            DESCRIPTION: [MessageHandler(filters.TEXT & ~filters.COMMAND, description_step)],
+            PRICE: [MessageHandler(filters.TEXT & ~filters.COMMAND, price_step)],
+            CONTACT: [MessageHandler(filters.TEXT & ~filters.COMMAND, contact_step)],
+        },
+        fallbacks=[CommandHandler('cancel', cancel)],
+        per_chat=True, per_user=True,
     )
-
-    app = (
-        Application.builder()
-        .token(TOKEN)
-        .request(request)
-        .build()
+    rating_conv = ConversationHandler(
+        entry_points=[CallbackQueryHandler(callback, pattern='^score:[1-5]$')],
+        states={RATE_COMMENT: [MessageHandler(filters.TEXT & ~filters.COMMAND, save_rating)]},
+        fallbacks=[CommandHandler('cancel', cancel)],
+        per_chat=True, per_user=True,
     )
-
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("help", help_command))
+    app.add_handler(CommandHandler('start', start))
+    app.add_handler(CommandHandler('help', help_cmd))
+    app.add_handler(CommandHandler('cancel', cancel))
+    app.add_handler(CommandHandler('admin', admin_cmd))
+    app.add_handler(listing_conv)
+    app.add_handler(rating_conv)
     app.add_handler(CallbackQueryHandler(callback))
+    app.add_error_handler(error_handler)
+    log.info('SUMMON Roblox Market started')
+    app.run_polling(drop_pending_updates=True)
 
-    print("SUMMON PvP COACH ishga tushdi!")
-    app.run_polling(
-        bootstrap_retries=5,
-        timeout=30,
-    )
-
-
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()
-

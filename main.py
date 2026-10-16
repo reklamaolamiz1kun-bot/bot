@@ -1,171 +1,12 @@
-import os
-import logging
-import sqlite3
-from datetime import datetime, timezone
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import (Application, CommandHandler, CallbackQueryHandler,
-    MessageHandler, ContextTypes, filters, ConversationHandler)
-
-TOKEN = os.getenv('BOT_TOKEN', '').strip()
-ADMIN_IDS = {int(x.strip()) for x in os.getenv('ADMIN_IDS', '').split(',') if x.strip().isdigit()}
-DB_PATH = os.getenv('DB_PATH', 'market.db')
-TITLE, DESCRIPTION, PRICE, CONTACT, RATE_ID, RATE_SCORE, RATE_COMMENT = range(7)
-logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(name)s: %(message)s')
-logging.getLogger('httpx').setLevel(logging.WARNING)
-log = logging.getLogger('summon_market')
-
-
-def db():
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    return conn
-
-
-def init_db():
-    with db() as c:
-        c.execute('''CREATE TABLE IF NOT EXISTS users (
-            user_id INTEGER PRIMARY KEY, username TEXT, first_name TEXT,
-            joined_at TEXT NOT NULL)''')
-        c.execute('''CREATE TABLE IF NOT EXISTS listings (
-            id INTEGER PRIMARY KEY AUTOINCREMENT, seller_id INTEGER NOT NULL,
-            title TEXT NOT NULL, description TEXT NOT NULL, price TEXT NOT NULL,
-            contact TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'pending',
-            created_at TEXT NOT NULL)''')
-        c.execute('''CREATE TABLE IF NOT EXISTS ratings (
-            id INTEGER PRIMARY KEY AUTOINCREMENT, listing_id INTEGER NOT NULL,
-            rater_id INTEGER NOT NULL, seller_id INTEGER NOT NULL,
-            score INTEGER NOT NULL, comment TEXT NOT NULL, created_at TEXT NOT NULL,
-            UNIQUE(listing_id, rater_id))''')
-
-
-def now():
-    return datetime.now(timezone.utc).isoformat(timespec='seconds')
-
-
-def register_user(user):
-    with db() as c:
-        c.execute('INSERT INTO users(user_id, username, first_name, joined_at) VALUES(?,?,?,?) '
-                  'ON CONFLICT(user_id) DO UPDATE SET username=excluded.username, first_name=excluded.first_name',
-                  (user.id, user.username or '', user.first_name or '', now()))
-
-
-def button(text, data, style='primary'):
-    # Button colors are supported only by compatible Telegram clients/Bot API versions.
-    try:
-        return InlineKeyboardButton(text, callback_data=data, style=style)
-    except TypeError:
-        return InlineKeyboardButton(text, callback_data=data)
-
-
-def kb(rows):
-    return InlineKeyboardMarkup(rows)
-
-
-def home_kb():
-    return kb([
-        [button('🛍 E’lonlarni ko‘rish', 'browse', 'success'), button('➕ E’lon berish', 'new', 'primary')],
-        [button('⭐ Reytinglar', 'ratings', 'success'), button('👤 Profilim', 'profile', 'primary')],
-        [button('📜 Qoidalar', 'rules', 'danger')],
-    ])
-
-
-def back_home():
-    return kb([[button('🏠 Bosh menyu', 'home', 'primary')]])
-
-
-def is_admin(user_id):
-    return user_id in ADMIN_IDS
-
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    register_user(user)
-    text = (f"🛒 SUMMON ROBLOX MARKET\n\nSalom, {user.first_name}!\n"
-            "Roblox o‘yinidagi itemlar va xizmatlar uchun e’lonlar maydoni.\n\n"
-            "✅ E’lonlar admin tekshiruvidan o‘tadi.\n"
-            "⚠️ Parol, cookie yoki akkauntga kirish ma’lumotlarini so‘ramang va yubormang.")
-    await update.effective_message.reply_text(text, reply_markup=home_kb())
-
-async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.effective_message.reply_text('/start — menyu\n/cancel — amalni bekor qilish\n/admin — admin panel (adminlar uchun)')
-
-async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data.clear()
-    await update.effective_message.reply_text('Amal bekor qilindi.', reply_markup=home_kb())
+        else:
+            await update.message.reply_text(caption + '\n\nAvatar rasmi hozircha olinmadi.', reply_markup=home_kb())
+    except httpx.TimeoutException:
+        await update.message.reply_text('⏳ Roblox serveri javob bermadi. Birozdan keyin urin.', reply_markup=home_kb())
+    except (httpx.HTTPError, ValueError, KeyError) as exc:
+        log.warning('Roblox avatar lookup failed: %s', exc)
+        await update.message.reply_text('⚠️ Roblox ma’lumotini olishda xato bo‘ldi. Keyinroq urin.', reply_markup=home_kb())
     return ConversationHandler.END
 
-async def new_listing(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.callback_query.answer()
-    context.user_data.clear()
-    await update.callback_query.message.reply_text('E’lon sarlavhasini yoz (5–70 belgi).\n/cancel — bekor qilish')
-    return TITLE
-
-async def title_step(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    title = update.message.text.strip()
-    if len(title) < 5 or len(title) > 70:
-        await update.message.reply_text('Sarlavha 5–70 belgi bo‘lsin. Qayta yoz:')
-        return TITLE
-    context.user_data['title'] = title
-    await update.message.reply_text('E’lon tavsifini yoz (10–500 belgi). Akkaunt paroli yoki cookie kiritma.')
-    return DESCRIPTION
-
-async def description_step(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    desc = update.message.text.strip()
-    if len(desc) < 10 or len(desc) > 500:
-        await update.message.reply_text('Tavsif 10–500 belgi bo‘lsin. Qayta yoz:')
-        return DESCRIPTION
-    context.user_data['description'] = desc
-    await update.message.reply_text('Narxni yoz (masalan: 25 000 so‘m, bepul yoki kelishiladi):')
-    return PRICE
-
-async def price_step(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    price = update.message.text.strip()
-    if len(price) > 40:
-        await update.message.reply_text('Narxni qisqaroq yoz:')
-        return PRICE
-    context.user_data['price'] = price
-    await update.message.reply_text('Aloqa usulini yoz: Telegram username yoki “shu bot orqali”. Telefon raqam majburiy emas.')
-    return CONTACT
-
-async def contact_step(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    contact = update.message.text.strip()
-    if len(contact) > 100:
-        await update.message.reply_text('Aloqa ma’lumoti 100 belgidan oshmasin:')
-        return CONTACT
-    user = update.effective_user
-    data = context.user_data
-    with db() as c:
-        cur = c.execute('INSERT INTO listings(seller_id,title,description,price,contact,status,created_at) VALUES(?,?,?,?,?,?,?)',
-            (user.id, data['title'], data['description'], data['price'], contact, 'pending', now()))
-        listing_id = cur.lastrowid
-    await update.message.reply_text(f'✅ E’lon #{listing_id} admin tekshiruviga yuborildi. Tasdiqlansa hammaga ko‘rinadi.', reply_markup=home_kb())
-    for admin_id in ADMIN_IDS:
-        try:
-            await context.bot.send_message(admin_id,
-                f'🆕 Yangi e’lon #{listing_id}\nSotuvchi: {user.full_name} (@{user.username or "yo‘q"})\n'
-                f'{data["title"]}\n{data["description"]}\nNarx: {data["price"]}\nAloqa: {contact}',
-                reply_markup=kb([[button('✅ Tasdiqlash', f'approve:{listing_id}', 'success'),
-                                  button('❌ Rad etish', f'reject:{listing_id}', 'danger')]]))
-        except Exception:
-            log.exception('Admin notification failed')
-    context.user_data.clear()
-    return ConversationHandler.END
-
-async def browse(query, context):
-    with db() as c:
-        rows = c.execute("SELECT id,title,description,price,seller_id FROM listings WHERE status='approved' ORDER BY id DESC LIMIT 10").fetchall()
-    if not rows:
-        await query.edit_message_text('Hozircha tasdiqlangan e’lon yo‘q.', reply_markup=back_home())
-        return
-    for row in rows:
-        with db() as c:
-            rating = c.execute('SELECT AVG(score) avg, COUNT(*) n FROM ratings WHERE seller_id=?', (row['seller_id'],)).fetchone()
-        avg = f"{rating['avg']:.1f}/5 ({rating['n']} ta)" if rating['n'] else 'hali reyting yo‘q'
-        text = (f"🛍 E’lon #{row['id']}\n{row['title']}\n\n{row['description']}\n\n"
-                f"💰 Narx: {row['price']}\n⭐ Sotuvchi reytingi: {avg}")
-        await context.bot.send_message(query.message.chat_id, text, reply_markup=kb([
-            [button('✉️ Sotuvchi bilan aloqa', f'contact:{row["id"]}', 'success'),
-             button('⭐ Baholash', f'rate:{row["id"]}', 'primary')]]))
-    await context.bot.send_message(query.message.chat_id, 'E’lonlar tugadi.', reply_markup=back_home())
 
 async def callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
@@ -178,6 +19,11 @@ async def callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await q.edit_message_text('🛒 SUMMON ROBLOX MARKET\nKerakli bo‘limni tanla:', reply_markup=home_kb())
     elif data == 'browse':
         await browse(q, context)
+    elif data == 'avatar_search':
+        return await avatar_search_start(update, context)
+    elif data.startswith('avatar_profile:'):
+        user_id = data.split(':', 1)[1]
+        await q.message.reply_text(f'https://www.roblox.com/users/{user_id}/profile')
     elif data == 'new':
         return await new_listing(update, context)
     elif data == 'rules':
@@ -291,6 +137,12 @@ def main():
         raise RuntimeError('Render Environment Variables ichida BOT_TOKEN qo‘shilmagan.')
     init_db()
     app = Application.builder().token(TOKEN).post_init(post_init).build()
+    avatar_conv = ConversationHandler(
+        entry_points=[CallbackQueryHandler(avatar_search_start, pattern='^avatar_search$')],
+        states={AVATAR_USERNAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, avatar_username_step)]},
+        fallbacks=[CommandHandler('cancel', cancel)],
+        per_chat=True, per_user=True,
+    )
     listing_conv = ConversationHandler(
         entry_points=[CallbackQueryHandler(new_listing, pattern='^new$')],
         states={
@@ -306,18 +158,3 @@ def main():
         entry_points=[CallbackQueryHandler(callback, pattern='^score:[1-5]$')],
         states={RATE_COMMENT: [MessageHandler(filters.TEXT & ~filters.COMMAND, save_rating)]},
         fallbacks=[CommandHandler('cancel', cancel)],
-        per_chat=True, per_user=True,
-    )
-    app.add_handler(CommandHandler('start', start))
-    app.add_handler(CommandHandler('help', help_cmd))
-    app.add_handler(CommandHandler('cancel', cancel))
-    app.add_handler(CommandHandler('admin', admin_cmd))
-    app.add_handler(listing_conv)
-    app.add_handler(rating_conv)
-    app.add_handler(CallbackQueryHandler(callback))
-    app.add_error_handler(error_handler)
-    log.info('SUMMON Roblox Market started')
-    app.run_polling(drop_pending_updates=True)
-
-if __name__ == '__main__':
-    main()

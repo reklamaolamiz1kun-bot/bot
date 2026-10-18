@@ -4,9 +4,10 @@ from urllib.parse import urlparse
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, ContextTypes, filters
 from yt_dlp import YoutubeDL
+from aiohttp import web
 
 TOKEN=os.getenv('BOT_TOKEN'); MAX_MB=int(os.getenv('MAX_FILE_MB','45')); ROOT=Path(os.getenv('WORKDIR','/tmp/summon_media')); ROOT.mkdir(parents=True,exist_ok=True)
-logging.basicConfig(level=logging.INFO); log=logging.getLogger('summon-media'); URL_RE=re.compile(r'https?://\S+',re.I)
+logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(name)s: %(message)s'); log=logging.getLogger('summon-media'); URL_RE=re.compile(r'https?://\S+',re.I)
 
 def menu(): return InlineKeyboardMarkup([[InlineKeyboardButton('🎵 Qo‘shiq qidirish',callback_data='search'),InlineKeyboardButton('🎙 Audio yuborish',callback_data='audio_help')],[InlineKeyboardButton('❔ Yordam',callback_data='help'),InlineKeyboardButton('📜 Qoidalar',callback_data='rules')]])
 def media_menu(job): return InlineKeyboardMarkup([[InlineKeyboardButton('🟢 Musiqasini yuklash',callback_data='music:'+job)],[InlineKeyboardButton('🔵 Dumaloq video qilish',callback_data='round:'+job)]])
@@ -85,7 +86,42 @@ async def callbacks(update:Update,context:ContextTypes.DEFAULT_TYPE):
             await q.message.reply_text('🔵 Tayyor! Fon xiralashtirildi.')
     except Exception as e: log.warning('Processing failed: %s',e); await q.message.reply_text('Faylni qayta ishlashda xatolik. FFmpeg o‘rnatilganini tekshir.')
     finally: shutil.rmtree(folder,ignore_errors=True)
-def main():
-    if not TOKEN: raise RuntimeError('BOT_TOKEN environment variable missing')
-    app=Application.builder().token(TOKEN).build(); app.add_handler(CommandHandler('start',start)); app.add_handler(CommandHandler('help',help_cmd)); app.add_handler(CommandHandler('song',song_cmd)); app.add_handler(CallbackQueryHandler(callbacks)); app.add_handler(MessageHandler(filters.VOICE|filters.AUDIO,audio_handler)); app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND,text_handler)); app.run_polling(allowed_updates=Update.ALL_TYPES)
-if __name__=='__main__': main()
+async def health(request):
+    return web.Response(text='SUMMON MEDIA is running', content_type='text/plain')
+
+async def main():
+    if not TOKEN:
+        raise RuntimeError('BOT_TOKEN environment variable missing. Add BOT_TOKEN in Render Environment.')
+    bot_app = Application.builder().token(TOKEN).build()
+    bot_app.add_handler(CommandHandler('start', start))
+    bot_app.add_handler(CommandHandler('help', help_cmd))
+    bot_app.add_handler(CommandHandler('song', song_cmd))
+    bot_app.add_handler(CallbackQueryHandler(callbacks))
+    bot_app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, audio_handler))
+    bot_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
+
+    # Render Web Service requires an HTTP server listening on 0.0.0.0:$PORT.
+    web_app = web.Application()
+    web_app.router.add_get('/', health)
+    web_app.router.add_get('/health', health)
+    runner = web.AppRunner(web_app)
+    await runner.setup()
+    site = web.TCPSite(runner, '0.0.0.0', int(os.getenv('PORT', '10000')))
+    await site.start()
+
+    await bot_app.initialize()
+    await bot_app.start()
+    if bot_app.updater is None:
+        raise RuntimeError('Telegram updater could not start')
+    await bot_app.updater.start_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=False)
+    log.info('SUMMON MEDIA bot and web health server started')
+    try:
+        await asyncio.Event().wait()
+    finally:
+        await bot_app.updater.stop()
+        await bot_app.stop()
+        await bot_app.shutdown()
+        await runner.cleanup()
+
+if __name__ == '__main__':
+    asyncio.run(main())

@@ -1,445 +1,91 @@
-import os
-import logging
-import sqlite3
-import httpx
-from datetime import datetime, timezone
+import os, re, asyncio, logging, tempfile, shutil, subprocess
+from pathlib import Path
+from urllib.parse import urlparse
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import (Application, CommandHandler, CallbackQueryHandler,
-    MessageHandler, ContextTypes, filters, ConversationHandler)
+from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, ContextTypes, filters
+from yt_dlp import YoutubeDL
 
-TOKEN = os.getenv('BOT_TOKEN', '').strip()
-ADMIN_IDS = {int(x.strip()) for x in os.getenv('ADMIN_IDS', '').split(',') if x.strip().isdigit()}
-DB_PATH = os.getenv('DB_PATH', 'market.db')
-TITLE, DESCRIPTION, PRICE, CONTACT, RATE_ID, RATE_SCORE, RATE_COMMENT, AVATAR_USERNAME = range(8)
-logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(name)s: %(message)s')
-logging.getLogger('httpx').setLevel(logging.WARNING)
-log = logging.getLogger('summon_market')
+TOKEN=os.getenv('BOT_TOKEN'); MAX_MB=int(os.getenv('MAX_FILE_MB','45')); ROOT=Path(os.getenv('WORKDIR','/tmp/summon_media')); ROOT.mkdir(parents=True,exist_ok=True)
+logging.basicConfig(level=logging.INFO); log=logging.getLogger('summon-media'); URL_RE=re.compile(r'https?://\S+',re.I)
 
-
-def db():
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    return conn
-
-
-def init_db():
-    with db() as c:
-        c.execute('''CREATE TABLE IF NOT EXISTS users (
-            user_id INTEGER PRIMARY KEY, username TEXT, first_name TEXT,
-            joined_at TEXT NOT NULL)''')
-        c.execute('''CREATE TABLE IF NOT EXISTS listings (
-            id INTEGER PRIMARY KEY AUTOINCREMENT, seller_id INTEGER NOT NULL,
-            title TEXT NOT NULL, description TEXT NOT NULL, price TEXT NOT NULL,
-            contact TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'pending',
-            created_at TEXT NOT NULL)''')
-        c.execute('''CREATE TABLE IF NOT EXISTS ratings (
-            id INTEGER PRIMARY KEY AUTOINCREMENT, listing_id INTEGER NOT NULL,
-            rater_id INTEGER NOT NULL, seller_id INTEGER NOT NULL,
-            score INTEGER NOT NULL, comment TEXT NOT NULL, created_at TEXT NOT NULL,
-            UNIQUE(listing_id, rater_id))''')
-
-
-def now():
-    return datetime.now(timezone.utc).isoformat(timespec='seconds')
-
-
-def register_user(user):
-    with db() as c:
-        c.execute('INSERT INTO users(user_id, username, first_name, joined_at) VALUES(?,?,?,?) '
-                  'ON CONFLICT(user_id) DO UPDATE SET username=excluded.username, first_name=excluded.first_name',
-                  (user.id, user.username or '', user.first_name or '', now()))
-
-
-def button(text, data, style='primary'):
-    # Button colors are supported only by compatible Telegram clients/Bot API versions.
+def menu(): return InlineKeyboardMarkup([[InlineKeyboardButton('🎵 Qo‘shiq qidirish',callback_data='search'),InlineKeyboardButton('🎙 Audio yuborish',callback_data='audio_help')],[InlineKeyboardButton('❔ Yordam',callback_data='help'),InlineKeyboardButton('📜 Qoidalar',callback_data='rules')]])
+def media_menu(job): return InlineKeyboardMarkup([[InlineKeyboardButton('🟢 Musiqasini yuklash',callback_data='music:'+job)],[InlineKeyboardButton('🔵 Dumaloq video qilish',callback_data='round:'+job)]])
+def too_big(p): return p.stat().st_size>MAX_MB*1024*1024
+def ydl_download(url,folder,audio=False):
+    opts={'outtmpl':str(folder/'%(title).60s-%(id)s.%(ext)s'),'noplaylist':True,'quiet':True,'no_warnings':True,'socket_timeout':20,'retries':2}
+    if audio: opts.update(format='bestaudio/best',postprocessors=[{'key':'FFmpegExtractAudio','preferredcodec':'mp3','preferredquality':'192'}])
+    else: opts.update(format='best[height<=720][ext=mp4]/best[height<=720]/best',merge_output_format='mp4')
+    with YoutubeDL(opts) as y: info=y.extract_info(url,download=True)
+    ext=['.mp3'] if audio else ['.mp4','.mkv','.webm','.mov']; files=[p for p in folder.iterdir() if p.is_file() and p.suffix.lower() in ext and p.stat().st_size]
+    if not files: raise RuntimeError('No output file')
+    return max(files,key=lambda p:p.stat().st_mtime),info
+def search_song(query,folder):
+    opts={'outtmpl':str(folder/'%(title).60s-%(id)s.%(ext)s'),'noplaylist':True,'quiet':True,'no_warnings':True,'format':'bestaudio/best','postprocessors':[{'key':'FFmpegExtractAudio','preferredcodec':'mp3','preferredquality':'192'}]}
+    with YoutubeDL(opts) as y: info=y.extract_info('ytsearch1:'+query,download=True)
+    entry=(info.get('entries') or [info])[0]; files=[p for p in folder.iterdir() if p.is_file() and p.suffix.lower()=='.mp3']
+    if not files: raise RuntimeError('No audio')
+    return max(files,key=lambda p:p.stat().st_mtime),entry.get('title',query),entry.get('webpage_url','')
+def round_video(src,dst):
+    cmd=['ffmpeg','-y','-i',str(src),'-filter_complex','[0:v]split=2[bg][fg];[bg]scale=640:640:force_original_aspect_ratio=increase,crop=640:640,boxblur=20:10[blur];[fg]scale=640:640:force_original_aspect_ratio=decrease[front];[blur][front]overlay=(W-w)/2:(H-h)/2,setsar=1,fps=30,format=yuv420p[v]','-map','[v]','-map','0:a?','-c:v','libx264','-preset','veryfast','-crf','25','-c:a','aac','-b:a','128k','-t','60','-movflags','+faststart',str(dst)]
+    subprocess.run(cmd,check=True,stdout=subprocess.DEVNULL,stderr=subprocess.PIPE)
+def esc(s): return (s or '').replace('&','&amp;').replace('<','&lt;').replace('>','&gt;')
+async def start(update:Update,context:ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text('💠 <b>SUMMON MEDIA</b>\n━━━━━━━━━━━━━━━━\n🎬 O‘zingga tegishli yoki yuklashga ruxsating bor video havolasini yubor.\n🎵 Qo‘shiq qidirish: /song nomi - ijrochi\nVideo tayyor bo‘lgach, musiqa yoki dumaloq video tugmasini tanla.',parse_mode='HTML',reply_markup=menu())
+async def help_cmd(update:Update,context:ContextTypes.DEFAULT_TYPE): await update.message.reply_text('Video linkini yubor, keyin 🟢 Musiqasini yuklash yoki 🔵 Dumaloq video qilishni tanla. Qo‘shiq uchun: /song nomi - ijrochi. Ayrim saytlar yuklashni cheklaydi; bot login yoki DRM himoyasini chetlab o‘tmaydi.',reply_markup=menu())
+async def text_handler(update:Update,context:ContextTypes.DEFAULT_TYPE):
+    text=(update.message.text or '').strip()
+    if text.startswith('/'): return
+    m=URL_RE.search(text)
+    if not m: return await update.message.reply_text('🎵 Qo‘shiq qidirish: /song nomi - ijrochi\nYoki video havolasini yubor.',reply_markup=menu())
+    url=m.group(0).rstrip(').,!?]'); parsed=urlparse(url)
+    if parsed.scheme not in ('http','https') or not parsed.netloc: return await update.message.reply_text('Havola noto‘g‘ri.')
+    folder=Path(tempfile.mkdtemp(prefix='dl_',dir=ROOT)); status=await update.message.reply_text('⏳ Havola tekshirilmoqda…')
     try:
-        return InlineKeyboardButton(text, callback_data=data, style=style)
-    except TypeError:
-        return InlineKeyboardButton(text, callback_data=data)
-
-
-def kb(rows):
-    return InlineKeyboardMarkup(rows)
-
-
-def home_kb():
-    return kb([
-        [button('🛍 E’lonlarni ko‘rish', 'browse', 'success'), button('➕ E’lon berish', 'new', 'primary')],
-        [button('⭐ Reytinglar', 'ratings', 'success'), button('👤 Profilim', 'profile', 'primary')],
-        [button('🧑‍🎤 Roblox Avatar Search', 'avatar_search', 'danger')],
-        [button('📜 Qoidalar', 'rules', 'danger')],
-    ])
-
-
-def back_home():
-    return kb([[button('🏠 Bosh menyu', 'home', 'primary')]])
-
-
-def roblox_search_kb(user_id):
-    return kb([
-        [button('👕 Classic Shirts', 'catalog:Classic+Shirts'), button('👖 Pants', 'catalog:Pants')],
-        [button('🧥 Layered Clothing', 'catalog:Layered+Clothing'), button('💇 Hair', 'catalog:Hair')],
-        [button('😎 Accessories', 'catalog:Accessories'), button('🕺 Animations', 'catalog:Animations')],
-        [button('🧍 Avatar items (worn)', f'worn:{user_id}', 'success')],
-        [button('💎 Robux / Premium info', 'robux_info')],
-        [button('🔗 Roblox profile', f'avatar_profile:{user_id}', 'success')],
-        [button('🏠 Bosh menyu', 'home', 'primary')],
-    ])
-
-
-def catalog_kb(query):
-    from urllib.parse import quote_plus
-    url = 'https://www.roblox.com/catalog?Keyword=' + quote_plus(query.replace('+', ' '))
-    return kb([[InlineKeyboardButton('🔎 Roblox Catalog’da ko‘rish', url=url)],
-               [button('⬅️ Avatar menyusi', 'avatar_menu'), button('🏠 Bosh menyu', 'home')]])
-
-
-def is_admin(user_id):
-    return user_id in ADMIN_IDS
-
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    register_user(user)
-    text = (f"🛒 SUMMON ROBLOX MARKET\n\nSalom, {user.first_name}!\n"
-            "Roblox o‘yinidagi itemlar va xizmatlar uchun e’lonlar maydoni.\n\n"
-            "✅ E’lonlar admin tekshiruvidan o‘tadi.\n"
-            "⚠️ Parol, cookie yoki akkauntga kirish ma’lumotlarini so‘ramang va yubormang.")
-    await update.effective_message.reply_text(text, reply_markup=home_kb())
-
-async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.effective_message.reply_text('/start — menyu\n/cancel — amalni bekor qilish\n/admin — admin panel (adminlar uchun)')
-
-async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data.clear()
-    await update.effective_message.reply_text('Amal bekor qilindi.', reply_markup=home_kb())
-    return ConversationHandler.END
-
-async def new_listing(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.callback_query.answer()
-    context.user_data.clear()
-    await update.callback_query.message.reply_text('E’lon sarlavhasini yoz (5–70 belgi).\n/cancel — bekor qilish')
-    return TITLE
-
-async def title_step(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    title = update.message.text.strip()
-    if len(title) < 5 or len(title) > 70:
-        await update.message.reply_text('Sarlavha 5–70 belgi bo‘lsin. Qayta yoz:')
-        return TITLE
-    context.user_data['title'] = title
-    await update.message.reply_text('E’lon tavsifini yoz (10–500 belgi). Akkaunt paroli yoki cookie kiritma.')
-    return DESCRIPTION
-
-async def description_step(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    desc = update.message.text.strip()
-    if len(desc) < 10 or len(desc) > 500:
-        await update.message.reply_text('Tavsif 10–500 belgi bo‘lsin. Qayta yoz:')
-        return DESCRIPTION
-    context.user_data['description'] = desc
-    await update.message.reply_text('Narxni yoz (masalan: 25 000 so‘m, bepul yoki kelishiladi):')
-    return PRICE
-
-async def price_step(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    price = update.message.text.strip()
-    if len(price) > 40:
-        await update.message.reply_text('Narxni qisqaroq yoz:')
-        return PRICE
-    context.user_data['price'] = price
-    await update.message.reply_text('Aloqa usulini yoz: Telegram username yoki “shu bot orqali”. Telefon raqam majburiy emas.')
-    return CONTACT
-
-async def contact_step(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    contact = update.message.text.strip()
-    if len(contact) > 100:
-        await update.message.reply_text('Aloqa ma’lumoti 100 belgidan oshmasin:')
-        return CONTACT
-    user = update.effective_user
-    data = context.user_data
-    with db() as c:
-        cur = c.execute('INSERT INTO listings(seller_id,title,description,price,contact,status,created_at) VALUES(?,?,?,?,?,?,?)',
-            (user.id, data['title'], data['description'], data['price'], contact, 'pending', now()))
-        listing_id = cur.lastrowid
-    await update.message.reply_text(f'✅ E’lon #{listing_id} admin tekshiruviga yuborildi. Tasdiqlansa hammaga ko‘rinadi.', reply_markup=home_kb())
-    for admin_id in ADMIN_IDS:
-        try:
-            await context.bot.send_message(admin_id,
-                f'🆕 Yangi e’lon #{listing_id}\nSotuvchi: {user.full_name} (@{user.username or "yo‘q"})\n'
-                f'{data["title"]}\n{data["description"]}\nNarx: {data["price"]}\nAloqa: {contact}',
-                reply_markup=kb([[button('✅ Tasdiqlash', f'approve:{listing_id}', 'success'),
-                                  button('❌ Rad etish', f'reject:{listing_id}', 'danger')]]))
-        except Exception:
-            log.exception('Admin notification failed')
-    context.user_data.clear()
-    return ConversationHandler.END
-
-async def browse(query, context):
-    with db() as c:
-        rows = c.execute("SELECT id,title,description,price,seller_id FROM listings WHERE status='approved' ORDER BY id DESC LIMIT 10").fetchall()
-    if not rows:
-        await query.edit_message_text('Hozircha tasdiqlangan e’lon yo‘q.', reply_markup=back_home())
-        return
-    for row in rows:
-        with db() as c:
-            rating = c.execute('SELECT AVG(score) avg, COUNT(*) n FROM ratings WHERE seller_id=?', (row['seller_id'],)).fetchone()
-        avg = f"{rating['avg']:.1f}/5 ({rating['n']} ta)" if rating['n'] else 'hali reyting yo‘q'
-        text = (f"🛍 E’lon #{row['id']}\n{row['title']}\n\n{row['description']}\n\n"
-                f"💰 Narx: {row['price']}\n⭐ Sotuvchi reytingi: {avg}")
-        await context.bot.send_message(query.message.chat_id, text, reply_markup=kb([
-            [button('✉️ Sotuvchi bilan aloqa', f'contact:{row["id"]}', 'success'),
-             button('⭐ Baholash', f'rate:{row["id"]}', 'primary')]]))
-    await context.bot.send_message(query.message.chat_id, 'E’lonlar tugadi.', reply_markup=back_home())
-
-async def avatar_search_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
-    await q.message.reply_text(
-        "🧑‍🎤 ROBLOX AVATAR SEARCH\n\n"
-        "Roblox username’ni yubor. Masalan: Builderman\n"
-        "Display name emas, profil username kerak.\n"
-        "/cancel — bekor qilish"
-    )
-    return AVATAR_USERNAME
-
-
-async def avatar_username_step(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    username = (update.message.text or '').strip()
-    if not username or len(username) > 20 or not username.replace('_', '').isalnum():
-        await update.message.reply_text('Username noto‘g‘ri ko‘rinadi. Faqat Roblox username yubor (20 belgigacha):')
-        return AVATAR_USERNAME
-
-    await update.message.reply_text(f'🔎 @{username} qidirilyapti...')
+        path,info=await asyncio.to_thread(ydl_download,url,folder,False)
+        if too_big(path): return await status.edit_text(f'Fayl {MAX_MB} MB limitidan katta.')
+        job=f'{update.effective_user.id}_{int(asyncio.get_running_loop().time()*1000)}'; saved=ROOT/('job_'+job); saved.mkdir(parents=True,exist_ok=True); dest=saved/path.name; shutil.copy2(path,dest); context.bot_data.setdefault('jobs',{})[job]=str(dest)
+        await status.delete(); await update.message.reply_text(f'✨ <b>Video tayyor!</b>\n🎬 {esc(info.get("title") or path.stem)}\n\nTugmani tanla:',parse_mode='HTML',reply_markup=media_menu(job))
+    except Exception as e: log.warning('Download failed: %s',e); await status.edit_text('❌ Bu havoladan yuklab bo‘lmadi. Sayt cheklagan yoki format qo‘llanmasligi mumkin.')
+    finally: shutil.rmtree(folder,ignore_errors=True)
+async def song_cmd(update:Update,context:ContextTypes.DEFAULT_TYPE):
+    query=' '.join(context.args).strip()
+    if not query: return await update.message.reply_text('Misol: /song qo‘shiq nomi - ijrochi')
+    folder=Path(tempfile.mkdtemp(prefix='song_',dir=ROOT)); msg=await update.message.reply_text('🔎 Qo‘shiq qidirilyapti…')
     try:
-        async with httpx.AsyncClient(timeout=15.0, follow_redirects=True) as client:
-            response = await client.post(
-                'https://users.roblox.com/v1/usernames/users',
-                json={'usernames': [username], 'excludeBannedUsers': False},
-            )
-            response.raise_for_status()
-            results = response.json().get('data', [])
-            if not results:
-                await update.message.reply_text('❌ Bu username topilmadi. Imlo xatosini tekshirib qayta urin.', reply_markup=home_kb())
-                return ConversationHandler.END
-            user = results[0]
-            user_id = user['id']
-            real_username = user.get('name', username)
-            display_name = user.get('displayName', real_username)
-            thumb_response = await client.get(
-                'https://thumbnails.roblox.com/v1/users/avatar?userIds=' + str(user_id) + '&size=720x720&format=Png&isCircular=false'
-            )
-            thumb_response.raise_for_status()
-            thumb_data = thumb_response.json().get('data', [])
-            image_url = thumb_data[0].get('imageUrl') if thumb_data else None
-
-        caption = (
-            f'🧑‍🎤 ROBLOX AVATAR\n\n'
-            f'👤 Display name: {display_name}\n'
-            f'🔎 Username: @{real_username}\n'
-            f'🆔 User ID: {user_id}\n'
-            f'🔗 Profil: https://www.roblox.com/users/{user_id}/profile'
-        )
-        context.user_data['roblox_user_id'] = user_id
-        context.user_data['roblox_username'] = real_username
-        if image_url:
-            await update.message.reply_photo(photo=image_url, caption=caption, reply_markup=roblox_search_kb(user_id))
-        else:
-            await update.message.reply_text(caption + '\n\nAvatar rasmi hozircha olinmadi.', reply_markup=roblox_search_kb(user_id))
-    except httpx.TimeoutException:
-        await update.message.reply_text('⏳ Roblox serveri javob bermadi. Birozdan keyin urin.', reply_markup=home_kb())
-    except (httpx.HTTPError, ValueError, KeyError) as exc:
-        log.warning('Roblox avatar lookup failed: %s', exc)
-        await update.message.reply_text('⚠️ Roblox ma’lumotini olishda xato bo‘ldi. Keyinroq urin.', reply_markup=home_kb())
-    return ConversationHandler.END
-
-
-async def callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    data = q.data
-    if data.startswith(('approve:', 'reject:')) and not is_admin(q.from_user.id):
-        await q.answer('Bu amal faqat admin uchun.', show_alert=True)
-        return
-    await q.answer()
-    if data == 'home':
-        await q.edit_message_text('🛒 SUMMON ROBLOX MARKET\nKerakli bo‘limni tanla:', reply_markup=home_kb())
-    elif data == 'browse':
-        await browse(q, context)
-    elif data == 'avatar_search':
-        return await avatar_search_start(update, context)
-    elif data.startswith('avatar_profile:'):
-        user_id = data.split(':', 1)[1]
-        await q.message.reply_text(f'https://www.roblox.com/users/{user_id}/profile')
-    elif data == 'avatar_menu':
-        user_id = context.user_data.get('roblox_user_id')
-        if not user_id:
-            await q.message.reply_text('Avval Roblox username qidiruvini bajaring.', reply_markup=home_kb())
-        else:
-            await q.message.reply_text('🧑‍🎤 AVATAR / INVENTORY SEARCH\nBo‘limni tanlang:', reply_markup=roblox_search_kb(user_id))
-    elif data.startswith('catalog:'):
-        query = data.split(':', 1)[1]
-        labels = {'Classic+Shirts':'Classic Shirts / Futbolkalar', 'Pants':'Pants / Shimlar', 'Layered+Clothing':'Layered Clothing / Ustki kiyimlar', 'Hair':'Hair / Sochlar', 'Accessories':'Accessories / Aksessuarlar', 'Animations':'Animations / Animatsiyalar'}
-        await q.message.reply_text('🛍 ' + labels.get(query, query) + '\nRoblox katalogini ochib itemlarni ko‘rishingiz mumkin. Narxlar katalogda ko‘rsatiladi.', reply_markup=catalog_kb(query))
-    elif data.startswith('worn:'):
-        user_id = data.split(':', 1)[1]
-        try:
-            async with httpx.AsyncClient(timeout=15.0) as client:
-                resp = await client.get(f'https://avatar.roblox.com/v1/users/{user_id}/currently-wearing')
-                resp.raise_for_status()
-                asset_ids = resp.json().get('assetIds', [])
-            if not asset_ids:
-                await q.message.reply_text('Hozir kiyilgan itemlar ro‘yxati ochiq API orqali olinmadi. Inventar maxfiy yoki bo‘sh bo‘lishi mumkin.', reply_markup=roblox_search_kb(user_id))
-            else:
-                lines = [f'• Asset ID: {aid} — https://www.roblox.com/catalog/{aid}' for aid in asset_ids[:30]]
-                await q.message.reply_text('🧥 AVATARDA KIYILGAN ITEMLAR\n\n' + '\n'.join(lines) + '\n\nNarx va rasmni item sahifasida tekshiring.', disable_web_page_preview=True, reply_markup=roblox_search_kb(user_id))
-        except (httpx.HTTPError, ValueError) as exc:
-            log.warning('Roblox currently-wearing lookup failed: %s', exc)
-            await q.message.reply_text('⚠️ Kiyilgan itemlarni hozir olib bo‘lmadi. Keyinroq urinib ko‘ring.', reply_markup=roblox_search_kb(user_id))
-    elif data == 'robux_info':
-        await q.message.reply_text('💎 ROBUX / PREMIUM\n\nRoblox ochiq API odatda foydalanuvchining joriy Robux balansini, Premium obunasini, xaridlar tarixini yoki qaysi o‘yinlarga qancha Robux donate qilganini ko‘rsatmaydi. Bot bularni taxmin qilib chiqarmaydi.\n\nOchiq avatar rasmi, username, profil va ayrim kiyilgan asset ID’larini esa ko‘rsatishi mumkin.', reply_markup=kb([[button('⬅️ Avatar menyusi', 'avatar_menu'), button('🏠 Bosh menyu', 'home')]]))
-    elif data == 'new':
-        return await new_listing(update, context)
-    elif data == 'rules':
-        await q.edit_message_text('📜 MARKET QOIDALARI\n\n• E’lonlar admin tomonidan tekshiriladi.\n• Roblox akkauntlarini, parol, cookie yoki login ma’lumotlarini sotish/so‘rash mumkin emas.\n• Aldov yoki soxta e’lonlar taqiqlanadi.\n• To‘lovdan oldin sotuvchini tekshiring; bot to‘lovni kafolatlamaydi.', reply_markup=back_home())
-    elif data == 'profile':
-        user = q.from_user
-        with db() as c:
-            listings = c.execute('SELECT COUNT(*) n FROM listings WHERE seller_id=?', (user.id,)).fetchone()['n']
-            rating = c.execute('SELECT AVG(score) avg, COUNT(*) n FROM ratings WHERE seller_id=?', (user.id,)).fetchone()
-        avg = f"{rating['avg']:.1f}/5 ({rating['n']} ta baho)" if rating['n'] else 'hali yo‘q'
-        await q.edit_message_text(f'👤 Profil\nID: {user.id}\nE’lonlar: {listings}\nReyting: {avg}', reply_markup=back_home())
-    elif data == 'ratings':
-        with db() as c:
-            rows = c.execute('SELECT seller_id, AVG(score) avg, COUNT(*) n FROM ratings GROUP BY seller_id ORDER BY avg DESC, n DESC LIMIT 10').fetchall()
-        if not rows:
-            text = '⭐ Hali reytinglar yo‘q.'
-        else:
-            text = '⭐ TOP SOTUVCHILAR\n\n' + '\n'.join(f"{i+1}. ID {r['seller_id']} — {r['avg']:.1f}/5 ({r['n']} ta)" for i,r in enumerate(rows))
-        await q.edit_message_text(text, reply_markup=back_home())
-    elif data.startswith('approve:') or data.startswith('reject:'):
-        action, sid = data.split(':')
-        status = 'approved' if action == 'approve' else 'rejected'
-        with db() as c:
-            c.execute('UPDATE listings SET status=? WHERE id=? AND status=?', (status, int(sid), 'pending'))
-            row = c.execute('SELECT seller_id,title FROM listings WHERE id=?', (int(sid),)).fetchone()
-        await q.edit_message_reply_markup(reply_markup=None)
-        await q.message.reply_text(f'#{sid} {"tasdiqlandi ✅" if status == "approved" else "rad etildi ❌"}')
-        if row:
-            try:
-                await context.bot.send_message(row['seller_id'], f'E’lon #{sid} holati: {"tasdiqlandi" if status == "approved" else "rad etildi"}.\n{row["title"]}')
-            except Exception:
-                pass
-    elif data.startswith('contact:'):
-        lid = int(data.split(':')[1])
-        with db() as c:
-            row = c.execute("SELECT seller_id,contact,title FROM listings WHERE id=? AND status='approved'", (lid,)).fetchone()
-        if not row:
-            await q.message.reply_text('E’lon topilmadi.')
-        elif row['seller_id'] == q.from_user.id:
-            await q.message.reply_text('Bu sening e’loning.')
-        else:
-            await q.message.reply_text(f"✉️ {row['title']}\nSotuvchi aloqa ma’lumoti: {row['contact']}\n\nShaxsiy ma’lumot va to‘lovda ehtiyot bo‘l.")
-    elif data.startswith('rate:'):
-        lid = int(data.split(':')[1])
-        with db() as c:
-            row = c.execute("SELECT seller_id FROM listings WHERE id=? AND status='approved'", (lid,)).fetchone()
-            exists = c.execute('SELECT 1 FROM ratings WHERE listing_id=? AND rater_id=?', (lid, q.from_user.id)).fetchone()
-        if not row or row['seller_id'] == q.from_user.id or exists:
-            await q.message.reply_text('Bu e’lonni baholab bo‘lmaydi (o‘zingniki yoki avval baholangan).')
-        else:
-            context.user_data['rate_listing'] = lid
-            context.user_data['rate_seller'] = row['seller_id']
-            await q.message.reply_text('Sotuvchiga 1 dan 5 gacha baho ber:', reply_markup=kb([[button(str(n)+' ⭐', f'score:{n}', 'success' if n >= 4 else 'primary') for n in range(1,6)]]))
-    elif data.startswith('score:'):
-        score = int(data.split(':')[1])
-        if not 1 <= score <= 5 or 'rate_listing' not in context.user_data:
-            await q.message.reply_text('Baholash sessiyasi tugagan. E’londan qayta boshlang.')
-        else:
-            context.user_data['rate_score'] = score
-            await q.message.reply_text('Qisqa izoh yoz (yoki “-”):')
-            return RATE_COMMENT
-    elif data == 'admin':
-        if not is_admin(q.from_user.id):
-            await q.answer('Ruxsat yo‘q', show_alert=True)
-            return
-        with db() as c:
-            pending = c.execute("SELECT COUNT(*) n FROM listings WHERE status='pending'").fetchone()['n']
-            users = c.execute('SELECT COUNT(*) n FROM users').fetchone()['n']
-            total = c.execute('SELECT COUNT(*) n FROM listings').fetchone()['n']
-        await q.edit_message_text(f'🛠 ADMIN PANEL\nFoydalanuvchilar: {users}\nJami e’lonlar: {total}\nKutilayotgan e’lonlar: {pending}', reply_markup=back_home())
-
-async def save_rating(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    comment = update.message.text.strip()[:250]
-    lid = context.user_data.get('rate_listing')
-    seller = context.user_data.get('rate_seller')
-    score = context.user_data.get('rate_score')
-    if not lid or not seller or not score:
-        await update.message.reply_text('Baholash topilmadi. E’londan qayta boshlang.')
-        return ConversationHandler.END
+        path,title,url=await asyncio.to_thread(search_song,query,folder)
+        if too_big(path): return await msg.edit_text('Audio hajmi limitdan katta.')
+        await msg.delete()
+        with path.open('rb') as f: await update.message.reply_audio(audio=f,title=title[:64],caption='🎵 '+esc(title),parse_mode='HTML')
+        if url: await update.message.reply_text('Manba: '+url)
+    except Exception as e: log.warning('Song search failed: %s',e); await msg.edit_text('❌ Qo‘shiq topilmadi yoki audio olishning iloji bo‘lmadi.')
+    finally: shutil.rmtree(folder,ignore_errors=True)
+async def audio_handler(update:Update,context:ContextTypes.DEFAULT_TYPE):
+    msg=update.message; media=msg.voice or msg.audio; folder=Path(tempfile.mkdtemp(prefix='aud_',dir=ROOT))
     try:
-        with db() as c:
-            c.execute('INSERT INTO ratings(listing_id,rater_id,seller_id,score,comment,created_at) VALUES(?,?,?,?,?,?)',
-                      (lid, update.effective_user.id, seller, score, comment, now()))
-        await update.message.reply_text('⭐ Bahoying saqlandi. Rahmat!', reply_markup=home_kb())
-    except sqlite3.IntegrityError:
-        await update.message.reply_text('Bu e’lonni avval baholagansan.', reply_markup=home_kb())
-    context.user_data.clear()
-    return ConversationHandler.END
-
-async def admin_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id):
-        await update.message.reply_text('Bu buyruq faqat admin uchun.')
-        return
-    with db() as c:
-        pending = c.execute("SELECT id,title,description,price,seller_id FROM listings WHERE status='pending' ORDER BY id LIMIT 10").fetchall()
-        users = c.execute('SELECT COUNT(*) n FROM users').fetchone()['n']
-        total = c.execute('SELECT COUNT(*) n FROM listings').fetchone()['n']
-    await update.message.reply_text(f'🛠 ADMIN PANEL\nFoydalanuvchilar: {users}\nJami e’lonlar: {total}\nKutilayotgan: {len(pending)}')
-    for r in pending:
-        await update.message.reply_text(f"#{r['id']} — {r['title']}\n{r['description']}\nNarx: {r['price']}\nSotuvchi ID: {r['seller_id']}", reply_markup=kb([[button('✅ Tasdiqlash', f"approve:{r['id']}", 'success'), button('❌ Rad etish', f"reject:{r['id']}", 'danger')]]))
-
-async def post_init(app):
-    await app.bot.set_my_commands([('start', 'Asosiy menyu'), ('help', 'Yordam'), ('cancel', 'Amalni bekor qilish'), ('admin', 'Admin panel')])
-
-async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
-    log.exception('Unhandled bot error', exc_info=context.error)
-
-
+        tg=await context.bot.get_file(media.file_id); ext='.ogg' if msg.voice else (Path(msg.audio.file_name or 'audio.mp3').suffix or '.mp3'); path=folder/('audio'+ext); await tg.download_to_drive(custom_path=str(path))
+        with path.open('rb') as f: await msg.reply_document(document=f,filename='SUMMON-audio'+ext,caption='🎙 Audio fayling tayyor.')
+    except Exception: await msg.reply_text('Audio faylni olishda xatolik bo‘ldi.')
+    finally: shutil.rmtree(folder,ignore_errors=True)
+async def callbacks(update:Update,context:ContextTypes.DEFAULT_TYPE):
+    q=update.callback_query; data=q.data or ''
+    if data in ('help','rules','search','audio_help'):
+        await q.answer(); texts={'help':'Video linkini yubor, so‘ng kerakli tugmani tanla. Qo‘shiq uchun /song nomi - ijrochi.','rules':'📜 Faqat o‘zingga tegishli yoki yuklashga ruxsating bor kontentdan foydalan. Parol, cookie yoki tasdiqlash kodini yuborma.','search':'🎵 Qo‘shiq qidirish: /song nomi - ijrochi','audio_help':'🎙 Ovoz yoki audio fayl yubor — bot uni qaytarib yuboradi.'}; return await q.message.reply_text(texts[data],reply_markup=menu())
+    action,job=data.split(':',1); src=context.bot_data.get('jobs',{}).get(job); await q.answer('Tayyorlanmoqda…')
+    if not src or not Path(src).exists(): return await q.message.reply_text('Video fayl muddati tugagan. Havolani qayta yubor.')
+    folder=Path(tempfile.mkdtemp(prefix='proc_',dir=ROOT))
+    try:
+        if action=='music':
+            out=folder/'audio.mp3'; await asyncio.to_thread(subprocess.run,['ffmpeg','-y','-i',src,'-vn','-codec:a','libmp3lame','-q:a','2',str(out)],check=True,stdout=subprocess.DEVNULL,stderr=subprocess.PIPE)
+            if too_big(out): return await q.message.reply_text('Audio hajmi limitdan katta.')
+            with out.open('rb') as f: await q.message.reply_audio(audio=f,title='SUMMON audio',caption='🟢 Videoning audiosi')
+        elif action=='round':
+            out=folder/'round.mp4'; await asyncio.to_thread(round_video,Path(src),out)
+            if too_big(out): return await q.message.reply_text('Dumaloq video hajmi limitdan katta.')
+            with out.open('rb') as f: await q.message.reply_video_note(video=f,duration=60,length=640)
+            await q.message.reply_text('🔵 Tayyor! Fon xiralashtirildi.')
+    except Exception as e: log.warning('Processing failed: %s',e); await q.message.reply_text('Faylni qayta ishlashda xatolik. FFmpeg o‘rnatilganini tekshir.')
+    finally: shutil.rmtree(folder,ignore_errors=True)
 def main():
-    if not TOKEN:
-        raise RuntimeError('Render Environment Variables ichida BOT_TOKEN qo‘shilmagan.')
-    init_db()
-    app = Application.builder().token(TOKEN).post_init(post_init).build()
-    avatar_conv = ConversationHandler(
-        entry_points=[CallbackQueryHandler(avatar_search_start, pattern='^avatar_search$')],
-        states={AVATAR_USERNAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, avatar_username_step)]},
-        fallbacks=[CommandHandler('cancel', cancel)],
-        per_chat=True, per_user=True,
-    )
-    listing_conv = ConversationHandler(
-        entry_points=[CallbackQueryHandler(new_listing, pattern='^new$')],
-        states={
-            TITLE: [MessageHandler(filters.TEXT & ~filters.COMMAND, title_step)],
-            DESCRIPTION: [MessageHandler(filters.TEXT & ~filters.COMMAND, description_step)],
-            PRICE: [MessageHandler(filters.TEXT & ~filters.COMMAND, price_step)],
-            CONTACT: [MessageHandler(filters.TEXT & ~filters.COMMAND, contact_step)],
-        },
-        fallbacks=[CommandHandler('cancel', cancel)],
-        per_chat=True, per_user=True,
-    )
-    rating_conv = ConversationHandler(
-        entry_points=[CallbackQueryHandler(callback, pattern='^score:[1-5]$')],
-        states={RATE_COMMENT: [MessageHandler(filters.TEXT & ~filters.COMMAND, save_rating)]},
-        fallbacks=[CommandHandler('cancel', cancel)],
-        per_chat=True, per_user=True,
-    )
-    app.add_handler(CommandHandler('start', start))
-    app.add_handler(CommandHandler('help', help_cmd))
-    app.add_handler(CommandHandler('cancel', cancel))
-    app.add_handler(CommandHandler('admin', admin_cmd))
-    app.add_handler(avatar_conv)
-    app.add_handler(listing_conv)
-    app.add_handler(rating_conv)
-    app.add_handler(CallbackQueryHandler(callback))
-    app.add_error_handler(error_handler)
-    log.info('SUMMON Roblox Market started')
-    app.run_polling(drop_pending_updates=True)
-
-if __name__ == '__main__':
-    main()
+    if not TOKEN: raise RuntimeError('BOT_TOKEN environment variable missing')
+    app=Application.builder().token(TOKEN).build(); app.add_handler(CommandHandler('start',start)); app.add_handler(CommandHandler('help',help_cmd)); app.add_handler(CommandHandler('song',song_cmd)); app.add_handler(CallbackQueryHandler(callbacks)); app.add_handler(MessageHandler(filters.VOICE|filters.AUDIO,audio_handler)); app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND,text_handler)); app.run_polling(allowed_updates=Update.ALL_TYPES)
+if __name__=='__main__': main()

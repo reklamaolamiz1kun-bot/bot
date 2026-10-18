@@ -1,0 +1,13 @@
+services:
+  - type: worker
+    name: summon-media-bot
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python main.py
+    envVars:
+      - key: BOT_TOKEN
+        sync: false
+      - key: MAX_FILE_MB
+        value: "45"
+      - key: WORKDIR
+        value: /tmp/summon_media

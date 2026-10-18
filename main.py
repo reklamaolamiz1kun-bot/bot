@@ -9,8 +9,18 @@ from aiohttp import web
 TOKEN=os.getenv('BOT_TOKEN'); MAX_MB=int(os.getenv('MAX_FILE_MB','45')); ROOT=Path(os.getenv('WORKDIR','/tmp/summon_media')); ROOT.mkdir(parents=True,exist_ok=True)
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(name)s: %(message)s'); log=logging.getLogger('summon-media'); URL_RE=re.compile(r'https?://\S+',re.I)
 
-def menu(): return InlineKeyboardMarkup([[InlineKeyboardButton('🎵 Qo‘shiq qidirish',callback_data='search'),InlineKeyboardButton('🎙 Audio yuborish',callback_data='audio_help')],[InlineKeyboardButton('❔ Yordam',callback_data='help'),InlineKeyboardButton('📜 Qoidalar',callback_data='rules')]])
-def media_menu(job): return InlineKeyboardMarkup([[InlineKeyboardButton('🟢 Musiqasini yuklash',callback_data='music:'+job)],[InlineKeyboardButton('🔵 Dumaloq video qilish',callback_data='round:'+job)]])
+def menu():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton('🟢 MUSIQA QIDIRISH', callback_data='search'), InlineKeyboardButton('🔵 AUDIO / OVOZ', callback_data='audio_help')],
+        [InlineKeyboardButton('🔴 YORDAM', callback_data='help'), InlineKeyboardButton('🔴 QOIDALAR', callback_data='rules')],
+    ])
+
+def media_menu(job):
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton('🟢 MUSIQASINI YUKLASH', callback_data='music:'+job)],
+        [InlineKeyboardButton('🔵 DUMALOQ VIDEO QILISH', callback_data='round:'+job)],
+        [InlineKeyboardButton('🔴 BEKOR QILISH', callback_data='cancel:'+job)],
+    ])
 def too_big(p): return p.stat().st_size>MAX_MB*1024*1024
 def ydl_download(url,folder,audio=False):
     opts={'outtmpl':str(folder/'%(title).60s-%(id)s.%(ext)s'),'noplaylist':True,'quiet':True,'no_warnings':True,'socket_timeout':20,'retries':2}
@@ -31,7 +41,20 @@ def round_video(src,dst):
     subprocess.run(cmd,check=True,stdout=subprocess.DEVNULL,stderr=subprocess.PIPE)
 def esc(s): return (s or '').replace('&','&amp;').replace('<','&lt;').replace('>','&gt;')
 async def start(update:Update,context:ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text('💠 <b>SUMMON MEDIA</b>\n━━━━━━━━━━━━━━━━\n🎬 O‘zingga tegishli yoki yuklashga ruxsating bor video havolasini yubor.\n🎵 Qo‘shiq qidirish: /song nomi - ijrochi\nVideo tayyor bo‘lgach, musiqa yoki dumaloq video tugmasini tanla.',parse_mode='HTML',reply_markup=menu())
+    user = update.effective_user
+    name = esc(user.first_name if user else 'do‘st')
+    text = (
+        '🎧 <b>SUMMON MUSIC</b>\n'
+        '🔴━━━━━━━━━━━━━━━━━━🔵\n'
+        f'Assalomu alaykum, <b>{name}</b>! 👋\n\n'
+        '🟢 <b>VIDEO HAVOLASI</b> — Instagram, TikTok yoki YouTube havolasini yubor.\n'
+        '🔵 <b>MUSIQA QIDIRISH</b> — qo‘shiq nomini yoz yoki pastdagi tugmani bos.\n'
+        '🔴 <b>AUDIO / OVOZ</b> — audio fayl yoki voice yubor.\n\n'
+        '<i>Video kelgach, undan musiqa ajratish yoki dumaloq video tayyorlash mumkin.</i>\n'
+        '🔴━━━━━━━━━━━━━━━━━━🔵\n'
+        '⚠️ Faqat foydalanishga ruxsating bor kontentni yukla.'
+    )
+    await update.message.reply_text(text, parse_mode='HTML', reply_markup=menu())
 async def help_cmd(update:Update,context:ContextTypes.DEFAULT_TYPE): await update.message.reply_text('Video linkini yubor, keyin 🟢 Musiqasini yuklash yoki 🔵 Dumaloq video qilishni tanla. Qo‘shiq uchun: /song nomi - ijrochi. Ayrim saytlar yuklashni cheklaydi; bot login yoki DRM himoyasini chetlab o‘tmaydi.',reply_markup=menu())
 async def text_handler(update:Update,context:ContextTypes.DEFAULT_TYPE):
     text=(update.message.text or '').strip()
@@ -45,7 +68,7 @@ async def text_handler(update:Update,context:ContextTypes.DEFAULT_TYPE):
         path,info=await asyncio.to_thread(ydl_download,url,folder,False)
         if too_big(path): return await status.edit_text(f'Fayl {MAX_MB} MB limitidan katta.')
         job=f'{update.effective_user.id}_{int(asyncio.get_running_loop().time()*1000)}'; saved=ROOT/('job_'+job); saved.mkdir(parents=True,exist_ok=True); dest=saved/path.name; shutil.copy2(path,dest); context.bot_data.setdefault('jobs',{})[job]=str(dest)
-        await status.delete(); await update.message.reply_text(f'✨ <b>Video tayyor!</b>\n🎬 {esc(info.get("title") or path.stem)}\n\nTugmani tanla:',parse_mode='HTML',reply_markup=media_menu(job))
+        await status.delete(); await update.message.reply_text(f'🟢 <b>VIDEO TAYYOR</b>\n🔴━━━━━━━━━━━━━━━━━━🔵\n🎬 <b>{esc(info.get("title") or path.stem)}</b>\n\nQaysi amalni bajarishni tanla:', parse_mode='HTML', reply_markup=media_menu(job))
     except Exception as e: log.warning('Download failed: %s',e); await status.edit_text('❌ Bu havoladan yuklab bo‘lmadi. Sayt cheklagan yoki format qo‘llanmasligi mumkin.')
     finally: shutil.rmtree(folder,ignore_errors=True)
 async def song_cmd(update:Update,context:ContextTypes.DEFAULT_TYPE):
@@ -68,22 +91,40 @@ async def audio_handler(update:Update,context:ContextTypes.DEFAULT_TYPE):
     except Exception: await msg.reply_text('Audio faylni olishda xatolik bo‘ldi.')
     finally: shutil.rmtree(folder,ignore_errors=True)
 async def callbacks(update:Update,context:ContextTypes.DEFAULT_TYPE):
-    q=update.callback_query; data=q.data or ''
+    q=update.callback_query
+    data=q.data or ''
     if data in ('help','rules','search','audio_help'):
-        await q.answer(); texts={'help':'Video linkini yubor, so‘ng kerakli tugmani tanla. Qo‘shiq uchun /song nomi - ijrochi.','rules':'📜 Faqat o‘zingga tegishli yoki yuklashga ruxsating bor kontentdan foydalan. Parol, cookie yoki tasdiqlash kodini yuborma.','search':'🎵 Qo‘shiq qidirish: /song nomi - ijrochi','audio_help':'🎙 Ovoz yoki audio fayl yubor — bot uni qaytarib yuboradi.'}; return await q.message.reply_text(texts[data],reply_markup=menu())
-    action,job=data.split(':',1); src=context.bot_data.get('jobs',{}).get(job); await q.answer('Tayyorlanmoqda…')
+        await q.answer()
+        if data == 'search':
+            return await q.message.reply_text('🟢 <b>QO‘SHIQ QIDIRISH</b>\n\nQuyidagi formatda yubor:\n<code>/song qo‘shiq nomi - ijrochi</code>\n\nMasalan: <code>/song Believer - Imagine Dragons</code>', parse_mode='HTML', reply_markup=menu())
+        texts={
+            'help':'🔴 <b>YORDAM</b>\nVideo havolasini yubor, keyin kerakli funksiyani tanla. Qo‘shiq uchun /song nomi - ijrochi yoz.',
+            'rules':'🔴 <b>QOIDALAR</b>\nFaqat o‘zingga tegishli yoki yuklashga ruxsating bor kontentdan foydalan. Parol, cookie yoki tasdiqlash kodlarini yuborma.',
+            'audio_help':'🔵 <b>AUDIO / OVOZ</b>\nVoice yoki audio fayl yubor — bot uni fayl sifatida qaytaradi.'
+        }
+        return await q.message.reply_text(texts[data], parse_mode='HTML', reply_markup=menu())
+    if ':' not in data:
+        await q.answer('Noma’lum buyruq', show_alert=True)
+        return
+    action,job=data.split(':',1)
+    if action == 'cancel':
+        context.bot_data.get('jobs',{}).pop(job,None)
+        await q.answer('Bekor qilindi')
+        return await q.message.reply_text('🔴 Amal bekor qilindi.', reply_markup=menu())
+    src=context.bot_data.get('jobs',{}).get(job)
+    await q.answer('Tayyorlanmoqda…')
     if not src or not Path(src).exists(): return await q.message.reply_text('Video fayl muddati tugagan. Havolani qayta yubor.')
     folder=Path(tempfile.mkdtemp(prefix='proc_',dir=ROOT))
     try:
         if action=='music':
             out=folder/'audio.mp3'; await asyncio.to_thread(subprocess.run,['ffmpeg','-y','-i',src,'-vn','-codec:a','libmp3lame','-q:a','2',str(out)],check=True,stdout=subprocess.DEVNULL,stderr=subprocess.PIPE)
             if too_big(out): return await q.message.reply_text('Audio hajmi limitdan katta.')
-            with out.open('rb') as f: await q.message.reply_audio(audio=f,title='SUMMON audio',caption='🟢 Videoning audiosi')
+            with out.open('rb') as f: await q.message.reply_audio(audio=f,title='SUMMON MUSIC',caption='🟢 <b>SUMMON MUSIC</b> • Videodan ajratilgan audio',parse_mode='HTML')
         elif action=='round':
             out=folder/'round.mp4'; await asyncio.to_thread(round_video,Path(src),out)
             if too_big(out): return await q.message.reply_text('Dumaloq video hajmi limitdan katta.')
             with out.open('rb') as f: await q.message.reply_video_note(video=f,duration=60,length=640)
-            await q.message.reply_text('🔵 Tayyor! Fon xiralashtirildi.')
+            await q.message.reply_text('🔵 <b>DUMALOQ VIDEO TAYYOR!</b>\nFon xiralashtirildi.', parse_mode='HTML', reply_markup=menu())
     except Exception as e: log.warning('Processing failed: %s',e); await q.message.reply_text('Faylni qayta ishlashda xatolik. FFmpeg o‘rnatilganini tekshir.')
     finally: shutil.rmtree(folder,ignore_errors=True)
 async def health(request):
